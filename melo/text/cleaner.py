@@ -1,9 +1,9 @@
-from . import chinese, japanese, english, chinese_mix, korean, french, spanish
+from . import chinese, japanese, english, chinese_mix, korean, french, spanish, german
 from . import cleaned_text_to_sequence
 import copy
 
 language_module_map = {"ZH": chinese, "JP": japanese, "EN": english, 'ZH_MIX_EN': chinese_mix, 'KR': korean,
-                    'FR': french, 'SP': spanish, 'ES': spanish}
+                    'FR': french, 'SP': spanish, 'ES': spanish, "DE": german}
 
 
 def clean_text(text, language):
@@ -29,6 +29,10 @@ def clean_text_bert(text, language, device=None):
 
 def text_to_sequence(text, language):
     norm_text, phones, tones, word2ph = clean_text(text, language)
+    try :
+        return cleaned_text_to_sequence(phones, tones, language)
+    except Exception as e:
+        print(f"2 Error: {e} not found in symbol_to_id_map")
     return cleaned_text_to_sequence(phones, tones, language)
 
 
