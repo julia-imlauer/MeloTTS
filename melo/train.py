@@ -28,6 +28,7 @@ from losses import generator_loss, discriminator_loss, feature_loss, kl_loss
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from text.symbols import symbols
 from melo.download_utils import load_pretrain_model
+from collections import deque
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = (
@@ -45,6 +46,25 @@ torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_math_sdp(True)
 global_step = 0
 
+def update_dwa_weights(loss_history, temp, device):
+    # Ensure we have at least two epochs to calculate the change in loss
+    if len(loss_history[0]) < 2:
+        return torch.ones(len(loss_history)).to(device)
+    
+    # Calculate weights based on the relative change in loss for each task
+    ratios = []
+    for task_losses in loss_history:
+        # Compute the loss ratio of the current epoch to the previous epoch
+        ratios.append(task_losses[-1] / task_losses[-2])
+    
+    # Convert ratios to tensor and move to the correct device
+    ratios = torch.tensor(ratios).to(device)
+    
+    # Calculate DWA weights using softmax over inverse temperature
+    weights = torch.softmax(ratios / temp, dim=0)
+    
+    return weights
+
 
 def run():
     hps = utils.get_hparams()
@@ -56,6 +76,8 @@ def run():
     )  # Use torchrun instead of mp.spawn
     rank = dist.get_rank()
     n_gpus = dist.get_world_size()
+
+    print(f"Rank: {rank} - GPUs: {n_gpus}")
     
     torch.manual_seed(hps.train.seed)
     torch.cuda.set_device(rank)
@@ -167,6 +189,9 @@ def run():
     net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
     
     pretrain_G, pretrain_D, pretrain_dur = load_pretrain_model()
+    #pretrain_G = None
+    #pretrain_D = None
+    #pretrain_dur = None
     hps.pretrain_G = hps.pretrain_G or pretrain_G
     hps.pretrain_D = hps.pretrain_D or pretrain_D
     hps.pretrain_dur = hps.pretrain_dur or pretrain_dur
@@ -251,6 +276,12 @@ def run():
         scheduler_dur_disc = None
     scaler = GradScaler(enabled=hps.train.fp16_run)
 
+    # Define weights for lass terms that are learned during training - Dynamic weight averaging
+    num_tasks = 5
+    loss_weights = torch.ones(num_tasks).cuda(rank)
+    loss_histories = [deque(maxlen=5) for _ in range(num_tasks)] 
+    loss_temp = 2.0
+
     for epoch in range(epoch_str, hps.train.epochs + 1):
         try:
             if rank == 0:
@@ -265,6 +296,9 @@ def run():
                     [train_loader, eval_loader],
                     logger,
                     [writer, writer_eval],
+                    loss_weights,
+                    loss_histories,
+                    loss_temp,
                 )
             else:
                 train_and_evaluate(
@@ -278,18 +312,24 @@ def run():
                     [train_loader, None],
                     None,
                     None,
+                    loss_weights,
+                    loss_histories,
+                    loss_temp,
                 )
         except Exception as e:
             print(e)
             torch.cuda.empty_cache()
-        scheduler_g.step()
-        scheduler_d.step()
-        if net_dur_disc is not None:
-            scheduler_dur_disc.step()
+            continue
+            #raise Exception("Training failed due to error in line 287")
+        if epoch > hps.train.warmup_epochs:
+            scheduler_g.step()
+            scheduler_d.step()
+            if net_dur_disc is not None:
+                scheduler_dur_disc.step()
 
 
 def train_and_evaluate(
-    rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers
+    rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, loss_weights, loss_histories, loss_temp
 ):
     net_g, net_d, net_dur_disc = nets
     optim_g, optim_d, optim_dur_disc = optims
@@ -429,7 +469,20 @@ def train_and_evaluate(
 
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)
+
+                gen_task_losses = [loss_gen, loss_mel, loss_fm, loss_dur, loss_kl]
+                for i in range(len(gen_task_losses)):
+                    loss_histories[i].append(gen_task_losses[i].item())
+                    # todo history management to keep 5 values only  
+
+                #loss_weights = update_dwa_weights(loss_histories, loss_temp, loss_gen.device)
+                
                 loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+
+                # compute weigted total loss
+                #gen_task_losses_tensor = torch.tensor(gen_task_losses).to(loss_gen.device)
+                #loss_gen_all = torch.dot(gen_task_losses_tensor,loss_weights.to(loss_gen.device))
+
                 if net_dur_disc is not None:
                     loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
                     loss_gen_all += loss_dur_gen
@@ -474,6 +527,14 @@ def train_and_evaluate(
                 )
                 scalar_dict.update(
                     {"loss/d_g/{}".format(i): v for i, v in enumerate(losses_disc_g)}
+                )
+                scalar_dict.update(
+                    {"loss/weights/w_loss_gen": loss_weights[0],
+                     "loss/weights/w_loss_mel": loss_weights[1],
+                     "loss/weights/w_loss_fm": loss_weights[2],
+                     "loss/weights/w_loss_dur": loss_weights[3],
+                     "loss/weights/w_loss_kl": loss_weights[4],
+                    }
                 )
 
                 image_dict = {

@@ -43,7 +43,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
         self.add_blank = hparams.add_blank
         self.min_text_len = getattr(hparams, "min_text_len", 1)
-        self.max_text_len = getattr(hparams, "max_text_len", 300)
+        self.max_text_len = getattr(hparams, "max_text_len", 500)
 
         random.seed(1234)
         random.shuffle(self.audiopaths_sid_text)
@@ -62,15 +62,18 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         lengths = []
         skipped = 0
         logger.info("Init dataset...")
+        #print(f"audiopaths_sid_text {self.audiopaths_sid_text}")
         for item in tqdm(
             self.audiopaths_sid_text
         ):
+            #print(f"item {item}")
             try:
                 _id, spk, language, text, phones, tone, word2ph = item
             except:
                 print(item)
                 raise
             audiopath = f"{_id}"
+            #print(f"min_text_len {self.min_text_len} max_text_len {self.max_text_len} len(phones) {len(phones)}")
             if self.min_text_len <= len(phones) and len(phones) <= self.max_text_len:
                 phones = phones.split(" ")
                 tone = [int(i) for i in tone.split(" ")]
@@ -78,9 +81,11 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 audiopaths_sid_text_new.append(
                     [audiopath, spk, language, text, phones, tone, word2ph]
                 )
+                #print(f"getsize {audiopath} {os.path.getsize(audiopath)}")
                 lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
             else:
                 skipped += 1
+        #print(f'lengths {lengths}')
         logger.info(f'min: {min(lengths)}; max: {max(lengths)}' )
         logger.info(
             "skipped: "
@@ -148,7 +153,11 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         return spec, audio_norm
 
     def get_text(self, text, word2ph, phone, tone, language_str, wav_path):
-        phone, tone, language = cleaned_text_to_sequence(phone, tone, language_str)
+        try:
+            phone, tone, language = cleaned_text_to_sequence(phone, tone, language_str)
+        except Exception as e:
+            print(f"3 Error: {e} not found in symbol_to_id_map - wav_path {wav_path}")
+            raise
         if self.add_blank:
             phone = commons.intersperse(phone, 0)
             tone = commons.intersperse(tone, 0)
@@ -159,6 +168,8 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         bert_path = wav_path.replace(".wav", ".bert.pt")
         try:
             bert = torch.load(bert_path)
+            if bert.shape[-1] != len(phone):
+                print(f"errorf with bert {wav_path} {bert.shape} {len(phone)} bert_path {bert_path}")
             assert bert.shape[-1] == len(phone)
         except Exception as e:
             print(e, wav_path, bert_path, bert.shape, len(phone))
@@ -173,7 +184,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             if language_str in ["ZH"]:
                 bert = bert
                 ja_bert = torch.zeros(768, len(phone))
-            elif language_str in ["JP", "EN", "ZH_MIX_EN", "KR", 'SP', 'ES', 'FR', 'DE', 'RU']:
+            elif language_str in ["JP", "EN", "ZH_MIX_EN", "KR", 'SP', 'ES', 'FR', 'RU', 'DE']:
                 ja_bert = bert
                 bert = torch.zeros(1024, len(phone))
             else:
